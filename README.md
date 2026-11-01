@@ -2,6 +2,8 @@
 
 This is an alternative firmware for the [Flip-Disc Clock](https://github.com/marcinsaj/Flipo-Clock-4x7-Segment-Flip-Disc-Display). The original clock had an Arduino Nano Every, I've swapped that out with Arduino Nano ESP32 which allows it to connect to the Internet and my local LAN.
 
+![Flip-disc clock](docs/clock.jpg)
+
 Added features:
 * Web configuration
 * Ability to update via OTA
