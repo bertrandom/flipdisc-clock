@@ -14,6 +14,12 @@ Added features:
 
 This is a rewrite of [flipdisc-clock-arduino](https://github.com/bertrandom/flipdisc-clock-arduino) which was just an Arduino sketch, this is a PlatformIO project. Many of the above features didn't exist in the previous version.
 
+## Web configuration
+
+The clock serves a status and settings page on port 80:
+
+<img src="docs/web-config.png" alt="Web configuration page" width="400">
+
 ## Configuration
 
 Copy `include/arduino_secrets.example.h` to `include/arduino_secrets.h`.
