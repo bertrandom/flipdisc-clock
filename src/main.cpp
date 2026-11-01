@@ -75,6 +75,7 @@ String HtmlSelect(const char *name, const char *label, const String &options);
 String HtmlOption(int value, const String &label, int selected);
 void HandleMqttMessages(void);
 void DisplayMqttMessage(const char *payload);
+void CheckMqttHold(void);
 
 #define DHT_PIN A0            // Digital pin connected to the DHT sensor
 #define DHTTYPE DHT22         // Sensor type
@@ -224,6 +225,11 @@ struct MqttMessage {
 };
 static const uint8_t mqtt_queue_length = 8;
 QueueHandle_t mqttMessageQueue;
+
+// How long a word, temperature or humidity shown from MQTT stays up before the time comes back
+const unsigned long mqtt_hold_interval = 10000;
+unsigned long mqtt_hold_start_time = 0;
+bool mqttHoldStatus = false;
 
 // OTA and MQTT are started the first time WiFi connects, so the clock runs without WiFi
 bool networkStarted = false;
@@ -740,6 +746,11 @@ void HandleMqttMessages(void)
 
 void DisplayMqttMessage(const char *payload)
 {
+    // Hold whatever is shown for mqtt_hold_interval before going back to the time,
+    // see CheckMqttHold(). A new message restarts the hold
+    mqttHoldStatus = true;
+    mqtt_hold_start_time = millis();
+
     if (strcmp(payload, "Temperature") == 0) {
       DisplayTemperature();
       return;
@@ -753,7 +764,10 @@ void DisplayMqttMessage(const char *payload)
 
     Flip.Display_3x1(1,0,0,0); // Clear dots
 
-    for (int i = 0; i < word.length(); i++) {
+    // Words shorter than 4 characters, and characters that can't be displayed, are blank
+    int flipValues[4] = {CLR, CLR, CLR, CLR};
+
+    for (int i = 0; i < word.length() && i <= 3; i++) {
         char character = word[i];
         int asciiValue = int(character);  // Get the ASCII value of the character
 
@@ -776,22 +790,48 @@ void DisplayMqttMessage(const char *payload)
             flipValue = HLM;
         }
 
-        if (flipValue >= 0 && i <= 3) {
+        if (flipValue >= 0) {
             Serial.print("Segment: ");
             Serial.print(i+1);
             Serial.print(", Flip Value: ");
             Serial.println(flipValue);
-            Flip.Display_7Seg(i+1,flipValue);
+            flipValues[i] = flipValue;
         }
     }
+
+    Flip.Matrix_7Seg(flipValues[0], flipValues[1], flipValues[2], flipValues[3]);
+}
+
+/************************************************************************************************/
+// Once the MQTT hold is over, go back to the time (or the rest period display)
+void CheckMqttHold(void)
+{
+  if(millis() - mqtt_hold_start_time < mqtt_hold_interval) return;
+
+  mqttHoldStatus = false;
+
+  // Restart the time/temperature/humidity sequence the same way the RTC minute interrupt does.
+  // Resetting rest_period_counter makes CheckRestPeriod() redraw the rest period display
+  sequenceRunning = false;
+  sequenceSecondRun = false;
+  timeDisplayStatus = false;
+  currentTimeStatus = false;
+  rest_period_counter = 0;
+  interruptRtcStatus = true;
 }
 
 /************************************************************************************************/
 void loop(void)
 {
   WatchButtons();
-  if(interruptRtcStatus == true) CheckRestPeriod();
-  if(timeDisplayStatus == true) DisplayTimeAndTemperature(); 
+  // While an MQTT message is held on the display, the minute interrupt and the
+  // time/temperature sequence wait until CheckMqttHold() ends the hold
+  if(mqttHoldStatus == true) CheckMqttHold();
+  else
+  {
+    if(interruptRtcStatus == true) CheckRestPeriod();
+    if(timeDisplayStatus == true) DisplayTimeAndTemperature();
+  }
   if(timeSettingsStatus == true) SettingTime();
   if(speedSettingsStatus == true) SettingSpeed();
   if(tempSettingsStatus == true) SettingTemp();
