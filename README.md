@@ -44,3 +44,7 @@ pio run -e ota
 ```
 
 OTA host is defined in `platformio.ini`, it must be changed if the IP address/hostname is incorrect.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0, the same license as [Flipo Clock](https://github.com/marcinsaj/Flipo-Clock-4x7-Segment-Flip-Disc-Display). See [LICENSE](LICENSE).
