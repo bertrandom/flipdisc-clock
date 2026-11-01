@@ -566,7 +566,13 @@ void HandleWebRoot(void)
   html += "<dt>Climate</dt><dd>" + climate_text + "</dd>";
   html += "<dt>NTP</dt><dd>" + ntp_text + "</dd>";
   html += "<dt>MQTT</dt><dd>" + String(mqttClient.isConnected() ? "Connected" : "Disconnected") + "</dd>";
-  html += "<dt>WiFi</dt><dd>" + WiFi.localIP().toString() + " (" + String(WiFi.RSSI()) + " dBm)</dd>";
+  // SSIDs can contain characters that are special in HTML
+  String ssid = WiFi.SSID();
+  ssid.replace("&", "&amp;");
+  ssid.replace("<", "&lt;");
+  ssid.replace(">", "&gt;");
+  html += "<dt>WiFi</dt><dd>" + ssid + " (" + String(WiFi.RSSI()) + " dBm)</dd>";
+  html += "<dt>IP address</dt><dd>" + WiFi.localIP().toString() + "</dd>";
   html += "<dt>Uptime</dt><dd>" + String(uptime_text) + "</dd>";
   html += "<dt>Firmware</dt><dd>" __DATE__ " " __TIME__ "</dd>";
   html += F("</dl></div>");
