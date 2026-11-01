@@ -36,7 +36,8 @@
 #include <EEPROM.h>           // https://www.arduino.cc/en/Reference/EEPROM
 #include <Adafruit_Sensor.h>  // https://github.com/adafruit/Adafruit_Sensor
 #include <DHT.h>              // https://github.com/adafruit/DHT-sensor-library
-#include <EspMQTTClient.h>    // https://github.com/plapointe6/EspMQTTClient - Library must be patched with https://github.com/plapointe6/EspMQTTClient/pull/138
+#include <WiFi.h>
+#include <ESP32MQTTClient.h>  // https://github.com/cyijun/ESP32MQTTClient - wrapper around ESP-IDF's esp-mqtt
 #include <ArduinoOTA.h>
 #include "time.h"
 #include <arduino_secrets.h>
@@ -60,6 +61,9 @@ void DisplayHumidity(void);
 void SettingSpeed(void);
 void SettingTemp(void);
 void SettingTime(void);
+void HandleNetwork(void);
+void HandleMqttMessages(void);
+void DisplayMqttMessage(const char *payload);
 
 #define DHT_PIN A0            // Digital pin connected to the DHT sensor
 #define DHTTYPE DHT22         // Sensor type
@@ -197,15 +201,21 @@ static const uint16_t ee_temp_hum_fq_address = 9;  // Temperature and humidity d
 // Required for EEPROM.begin(eeprom_size) for Arduino Nano ESP32
 static const uint8_t eeprom_size = 10;
 
-EspMQTTClient client(
-  SECRET_WIFI_SSID,
-  SECRET_WIFI_PASSWORD,
-  SECRET_MQTT_HOSTNAME,
-  SECRET_MQTT_USER,
-  SECRET_MQTT_PASSWORD,
-  SECRET_MQTT_CLIENT_NAME,
-  SECRET_MQTT_PORT
-);
+#define MQTT_TOPIC "iot/flipdisc"
+
+ESP32MQTTClient mqttClient;
+
+// MQTT messages arrive on the esp-mqtt task, but the flip-disc display must only be
+// driven from loop(). The MQTT callback copies each payload into this queue and
+// loop() takes them off and displays them, so the display is never touched by two tasks.
+struct MqttMessage {
+  char payload[32];
+};
+static const uint8_t mqtt_queue_length = 8;
+QueueHandle_t mqttMessageQueue;
+
+// OTA and MQTT are started the first time WiFi connects, so the clock runs without WiFi
+bool networkStarted = false;
 
 /************************************************************************************************/
 // Interrupt from RTC
@@ -325,11 +335,21 @@ void setup()
   if(hum_on_off != ON && hum_on_off != OFF) hum_on_off = OFF;              // Turn off humidity display
   if(temp_hum_fq != THFQ60 && temp_hum_fq != THFQ30) temp_hum_fq = THFQ60; // Set the temperature and humidity display frequency to 60 seconds
 
-  client.enableDebuggingMessages(); // Enable debugging messages sent to serial output
+  mqttMessageQueue = xQueueCreate(mqtt_queue_length, sizeof(MqttMessage));
+
+  // WiFi connects in the background and reconnects automatically, see HandleNetwork()
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(SECRET_MQTT_CLIENT_NAME);
+  WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASSWORD);
+
+  mqttClient.enableDebuggingMessages(); // Enable debugging messages sent to serial output
+  mqttClient.setURL(SECRET_MQTT_HOSTNAME, SECRET_MQTT_PORT, SECRET_MQTT_USER, SECRET_MQTT_PASSWORD);
+  mqttClient.setMqttClientName(SECRET_MQTT_CLIENT_NAME);
 
   // OTA updates - hostname is SECRET_MQTT_CLIENT_NAME, password comes from secrets.ini.
-  // EspMQTTClient calls ArduinoOTA.begin() once WiFi is up and ArduinoOTA.handle() in client.loop()
-  client.enableOTA(OTA_PASSWORD);
+  // ArduinoOTA.handle() runs in loop(), so these callbacks can safely use the display
+  ArduinoOTA.setHostname(SECRET_MQTT_CLIENT_NAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
   ArduinoOTA.onStart([]() {
     Serial.println("OTA update started");
     Flip.Display_3x1(1, 0,0,0);
@@ -343,16 +363,72 @@ void setup()
   DisplayTime();
 }
 
-// This function is called once everything is connected (Wifi and MQTT)
-// WARNING : YOU MUST IMPLEMENT IT IF YOU USE EspMQTTClient
-void onConnectionEstablished()
+/************************************************************************************************/
+// Start OTA and MQTT once WiFi first connects. After that WiFi and esp-mqtt reconnect on their own
+void HandleNetwork(void)
 {
-  client.subscribe("iot/flipdisc", [](const String & payload) {
+  if(networkStarted == false)
+  {
+    if(WiFi.status() != WL_CONNECTED) return;
 
-    if (payload == "Temperature") {
+    Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+    ArduinoOTA.begin();
+    mqttClient.loopStart(); // Starts the esp-mqtt task and returns immediately
+    networkStarted = true;
+  }
+
+  ArduinoOTA.handle();
+}
+
+/************************************************************************************************/
+// Called by ESP32MQTTClient on the esp-mqtt task when the broker connection is established
+void onMqttConnect(esp_mqtt_client_handle_t client)
+{
+  if(!mqttClient.isMyTurn(client)) return;
+
+  // Runs on the esp-mqtt task - only queue the payload, never touch the display here
+  mqttClient.subscribe(MQTT_TOPIC, [](const std::string &payload) {
+    MqttMessage message;
+    strlcpy(message.payload, payload.c_str(), sizeof(message.payload));
+    if(xQueueSend(mqttMessageQueue, &message, 0) != pdTRUE)
+      Serial.println("MQTT message queue full, dropping message");
+  });
+}
+
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
+esp_err_t handleMQTT(esp_mqtt_event_handle_t event)
+{
+  mqttClient.onEventCallback(event);
+  return ESP_OK;
+}
+#else
+void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+  (void)base;
+  (void)event_id;
+  auto *client = static_cast<ESP32MQTTClient *>(handler_args);
+  auto *event = static_cast<esp_mqtt_event_handle_t>(event_data);
+  client->onEventCallback(event);
+}
+#endif
+
+/************************************************************************************************/
+// Display any MQTT messages queued by the esp-mqtt task, called from loop()
+void HandleMqttMessages(void)
+{
+  MqttMessage message;
+  while(xQueueReceive(mqttMessageQueue, &message, 0) == pdTRUE)
+  {
+    DisplayMqttMessage(message.payload);
+  }
+}
+
+void DisplayMqttMessage(const char *payload)
+{
+    if (strcmp(payload, "Temperature") == 0) {
       DisplayTemperature();
       return;
-    } else if (payload == "Humidity") {
+    } else if (strcmp(payload, "Humidity") == 0) {
       DisplayHumidity();
       return;
     }
@@ -393,8 +469,6 @@ void onConnectionEstablished()
             Flip.Display_7Seg(i+1,flipValue);
         }
     }
-
-  });
 }
 
 /************************************************************************************************/
@@ -406,7 +480,8 @@ void loop(void)
   if(timeSettingsStatus == true) SettingTime();
   if(speedSettingsStatus == true) SettingSpeed();
   if(tempSettingsStatus == true) SettingTemp();
-  client.loop();
+  HandleNetwork();
+  HandleMqttMessages();
 }
 
 /************************************************************************************************/
