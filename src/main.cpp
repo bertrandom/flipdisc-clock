@@ -62,6 +62,7 @@ void SettingSpeed(void);
 void SettingTemp(void);
 void SettingTime(void);
 void HandleNetwork(void);
+void SyncTimeNTP(void);
 void HandleMqttMessages(void);
 void DisplayMqttMessage(const char *payload);
 
@@ -216,6 +217,16 @@ QueueHandle_t mqttMessageQueue;
 
 // OTA and MQTT are started the first time WiFi connects, so the clock runs without WiFi
 bool networkStarted = false;
+
+// POSIX TZ string used to convert NTP time to the local time stored in the RTC.
+// newlib doesn't understand IANA names, so this is America/Los_Angeles.
+#ifndef TIMEZONE
+#define TIMEZONE "PST8PDT,M3.2.0,M11.1.0"
+#endif
+#define NTP_SERVER "pool.ntp.org"
+
+// The RTC is checked against NTP once per boot, after the first successful NTP sync
+bool ntpSyncDone = false;
 
 /************************************************************************************************/
 // Interrupt from RTC
@@ -374,10 +385,52 @@ void HandleNetwork(void)
     Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
     ArduinoOTA.begin();
     mqttClient.loopStart(); // Starts the esp-mqtt task and returns immediately
+    configTzTime(TIMEZONE, NTP_SERVER); // Starts SNTP in the background
     networkStarted = true;
   }
 
   ArduinoOTA.handle();
+  if(ntpSyncDone == false) SyncTimeNTP();
+}
+
+/************************************************************************************************/
+// Once SNTP has the time, update the RTC if it differs. Called from loop() until it succeeds
+void SyncTimeNTP(void)
+{
+  // Don't change the time underneath the settings menus
+  if(modeSettingsStatus == true) return;
+
+  // Returns false until SNTP has set the system clock; a 0ms timeout keeps this non-blocking
+  struct tm local;
+  if(!getLocalTime(&local, 0)) return;
+
+  tmElements_t ntp_tm;
+  ntp_tm.Second = local.tm_sec;
+  ntp_tm.Minute = local.tm_min;
+  ntp_tm.Hour = local.tm_hour;
+  ntp_tm.Wday = local.tm_wday + 1;                    // TimeLib: Sunday is 1
+  ntp_tm.Day = local.tm_mday;
+  ntp_tm.Month = local.tm_mon + 1;                    // TimeLib: January is 1
+  ntp_tm.Year = CalendarYrToTm(local.tm_year + 1900); // TimeLib: offset from 1970
+  time_t ntp_time = makeTime(ntp_tm);
+
+  time_t rtc_time = RTC_RX8025T.get();
+  long difference = (long)(ntp_time - rtc_time);
+
+  // The RTC only has one second resolution, so allow a second of difference
+  if(abs(difference) > 1)
+  {
+    RTC_RX8025T.set(ntp_time);
+    Serial.printf("RTC was off by %lds, set from NTP: %02d:%02d:%02d\n",
+                  difference, ntp_tm.Hour, ntp_tm.Minute, ntp_tm.Second);
+
+    // Redisplay the time the same way the RTC minute interrupt does
+    currentTimeStatus = false;
+    interruptRtcStatus = true;
+  }
+  else Serial.println("RTC matches NTP time");
+
+  ntpSyncDone = true;
 }
 
 /************************************************************************************************/
