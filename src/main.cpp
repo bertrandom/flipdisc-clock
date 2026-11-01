@@ -279,7 +279,7 @@ void setup()
 
   // his function allows you to display numbers and symbols
   // Flip.Matrix_7Seg(data1,data2,data3,data4); 
-  Flip.Matrix_7Seg(T,E,S,T);
+  Flip.Matrix_7Seg(B,E,R,T);
   delay(1500);
   Flip.Matrix_7Seg(I,R,I,S);
   delay(1500);
