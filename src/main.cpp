@@ -39,6 +39,8 @@
 #include <WiFi.h>
 #include <ESP32MQTTClient.h>  // https://github.com/cyijun/ESP32MQTTClient - wrapper around ESP-IDF's esp-mqtt
 #include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include "time.h"
 #include <arduino_secrets.h>
 
@@ -62,7 +64,15 @@ void SettingSpeed(void);
 void SettingTemp(void);
 void SettingTime(void);
 void HandleNetwork(void);
-void SyncTimeNTP(void);
+bool SyncTimeNTP(void);
+void SetupWebServer(void);
+void HandleWebRoot(void);
+void HandleWebSettings(void);
+void HandleWebSync(void);
+void ApplySettings(void);
+String FormatHour(uint8_t hour);
+String HtmlSelect(const char *name, const char *label, const String &options);
+String HtmlOption(int value, const String &label, int selected);
 void HandleMqttMessages(void);
 void DisplayMqttMessage(const char *payload);
 
@@ -225,8 +235,14 @@ bool networkStarted = false;
 #endif
 #define NTP_SERVER "pool.ntp.org"
 
-// The RTC is checked against NTP once per boot, after the first successful NTP sync
+// The RTC is checked against NTP once per boot, after the first successful NTP sync,
+// and again whenever "Sync time from NTP" is pressed on the web page
 bool ntpSyncDone = false;
+long ntp_last_difference = 0; // Seconds the RTC was off at the last NTP check
+
+// Web config page, started with OTA and MQTT. handleClient() runs from loop(),
+// so its handlers can safely change settings and drive the display
+WebServer server(80);
 
 /************************************************************************************************/
 // Interrupt from RTC
@@ -371,6 +387,8 @@ void setup()
     DisplayTime();
   });
 
+  SetupWebServer();
+
   DisplayTime();
 }
 
@@ -383,26 +401,30 @@ void HandleNetwork(void)
     if(WiFi.status() != WL_CONNECTED) return;
 
     Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
-    ArduinoOTA.begin();
+    ArduinoOTA.begin(); // Also starts mDNS, so the clock is reachable as <hostname>.local
     mqttClient.loopStart(); // Starts the esp-mqtt task and returns immediately
     configTzTime(TIMEZONE, NTP_SERVER); // Starts SNTP in the background
+    server.begin();
+    MDNS.addService("http", "tcp", 80);
     networkStarted = true;
   }
 
   ArduinoOTA.handle();
+  server.handleClient();
   if(ntpSyncDone == false) SyncTimeNTP();
 }
 
 /************************************************************************************************/
-// Once SNTP has the time, update the RTC if it differs. Called from loop() until it succeeds
-void SyncTimeNTP(void)
+// Once SNTP has the time, update the RTC if it differs. Called from loop() until it succeeds.
+// Returns false if SNTP doesn't have the time yet
+bool SyncTimeNTP(void)
 {
   // Don't change the time underneath the settings menus
-  if(modeSettingsStatus == true) return;
+  if(modeSettingsStatus == true) return false;
 
   // Returns false until SNTP has set the system clock; a 0ms timeout keeps this non-blocking
   struct tm local;
-  if(!getLocalTime(&local, 0)) return;
+  if(!getLocalTime(&local, 0)) return false;
 
   tmElements_t ntp_tm;
   ntp_tm.Second = local.tm_sec;
@@ -430,7 +452,241 @@ void SyncTimeNTP(void)
   }
   else Serial.println("RTC matches NTP time");
 
+  ntp_last_difference = difference;
   ntpSyncDone = true;
+  return true;
+}
+
+/************************************************************************************************/
+// Web config page - status plus every option the buttons can set. There is no authentication,
+// anyone on the network can change the settings
+void SetupWebServer(void)
+{
+  server.on("/", HTTP_GET, HandleWebRoot);
+  server.on("/settings", HTTP_POST, HandleWebSettings);
+  server.on("/sync", HTTP_POST, HandleWebSync);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+}
+
+// Hour label in the clock's current 12/24 hour format, e.g. "11 PM" or "23:00"
+String FormatHour(uint8_t hour)
+{
+  if(time_hr == HR24) return (hour < 10 ? "0" : "") + String(hour) + ":00";
+
+  uint8_t hour_12 = hour % 12;
+  if(hour_12 == 0) hour_12 = 12;
+  return String(hour_12) + (hour < 12 ? " AM" : " PM");
+}
+
+String HtmlOption(int value, const String &label, int selected)
+{
+  return "<option value=\"" + String(value) + "\"" + (value == selected ? " selected" : "") + ">" + label + "</option>";
+}
+
+String HtmlSelect(const char *name, const char *label, const String &options)
+{
+  return "<label>" + String(label) + "<select name=\"" + String(name) + "\">" + options + "</select></label>";
+}
+
+void HandleWebRoot(void)
+{
+  // Read into a local copy so the display's tm and currentTimeStatus are left alone
+  tmElements_t rtc_tm;
+  RTC_RX8025T.read(rtc_tm);
+
+  char time_text[16];
+  if(time_hr == HR24) snprintf(time_text, sizeof(time_text), "%02d:%02d:%02d", rtc_tm.Hour, rtc_tm.Minute, rtc_tm.Second);
+  else
+  {
+    uint8_t hour_12 = rtc_tm.Hour % 12;
+    if(hour_12 == 0) hour_12 = 12;
+    snprintf(time_text, sizeof(time_text), "%d:%02d:%02d %s", hour_12, rtc_tm.Minute, rtc_tm.Second, rtc_tm.Hour < 12 ? "AM" : "PM");
+  }
+
+  // The DHT library caches readings for 2 seconds, so this doesn't disturb the display's measurements
+  bool fahrenheit = (temp_c_f == TPF);
+  float web_temperature = dht.readTemperature(fahrenheit);
+  float web_humidity = dht.readHumidity();
+  String climate_text = "Sensor not responding";
+  if(!isnan(web_temperature) && !isnan(web_humidity))
+  {
+    float heat_index = dht.computeHeatIndex(web_temperature, web_humidity, fahrenheit);
+    const char *unit = fahrenheit ? "&deg;F" : "&deg;C";
+    climate_text = String(web_temperature, 1) + unit + " (feels like " + String(heat_index, 1) + unit + "), "
+                 + String(web_humidity, 0) + "% humidity";
+  }
+
+  String ntp_text = "Waiting for NTP";
+  if(ntpSyncDone == true)
+  {
+    if(abs(ntp_last_difference) > 1) ntp_text = "RTC was off by " + String(ntp_last_difference) + "s and was corrected";
+    else ntp_text = "RTC matched NTP";
+  }
+
+  unsigned long uptime = millis() / 1000;
+  char uptime_text[24];
+  snprintf(uptime_text, sizeof(uptime_text), "%lud %luh %lum", uptime / 86400, (uptime / 3600) % 24, (uptime / 60) % 60);
+
+  String message = "";
+  String msg = server.arg("msg");
+  if(msg == "saved") message = "Settings saved.";
+  else if(msg == "synced") message = "Time checked against NTP. " + ntp_text + ".";
+  else if(msg == "nosync") message = "NTP time isn't available yet, try again in a moment.";
+
+  String options;
+  String html;
+  html.reserve(8000);
+
+  html += F("<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<title>Flip-disc Clock</title><style>"
+            ":root{color-scheme:light dark;--bg:#f6f6f4;--card:#fff;--fg:#1d1d1b;--muted:#6b6b66;--line:#e2e2dd;--accent:#c2410c;--on-accent:#fff}"
+            "@media(prefers-color-scheme:dark){:root{--bg:#161615;--card:#21211f;--fg:#ededea;--muted:#9a9a93;--line:#34342f;--accent:#fb923c;--on-accent:#1d1d1b}}"
+            "body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,sans-serif}"
+            "main{max-width:520px;margin:0 auto;padding:24px 16px 48px}"
+            "h1{font-size:1.4rem;margin:0 0 4px}h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:28px 0 8px}"
+            ".time{font:600 2.6rem/1.1 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums;margin:12px 0 4px}"
+            ".card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:4px 16px}"
+            "dl{display:grid;grid-template-columns:auto 1fr;gap:0 16px;margin:0}dt,dd{padding:10px 0;border-bottom:1px solid var(--line);margin:0}"
+            "dt{color:var(--muted)}dd{text-align:right;overflow-wrap:anywhere}dl>:nth-last-child(-n+2){border-bottom:0}"
+            "label{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 0;border-bottom:1px solid var(--line)}"
+            "form .card label:last-child{border-bottom:0}"
+            "select{font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}"
+            "button{font:inherit;font-weight:600;padding:10px 18px;border-radius:8px;border:0;background:var(--accent);color:var(--on-accent);cursor:pointer;margin-top:12px}"
+            "button.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent)}"
+            ".msg{background:var(--card);border-left:3px solid var(--accent);padding:10px 12px;border-radius:6px;margin:16px 0 0}"
+            ".note{color:var(--muted);font-size:.85rem;margin:8px 0 0}"
+            "</style></head><body><main><h1>Flip-disc Clock</h1>");
+
+  if(message.length() > 0) html += "<p class=\"msg\">" + message + "</p>";
+
+  html += "<div class=\"time\">" + String(time_text) + "</div><p class=\"note\">Time from the clock's RTC</p>";
+
+  html += F("<h2>Status</h2><div class=\"card\"><dl>");
+  html += "<dt>Climate</dt><dd>" + climate_text + "</dd>";
+  html += "<dt>NTP</dt><dd>" + ntp_text + "</dd>";
+  html += "<dt>MQTT</dt><dd>" + String(mqttClient.isConnected() ? "Connected" : "Disconnected") + "</dd>";
+  html += "<dt>WiFi</dt><dd>" + WiFi.localIP().toString() + " (" + String(WiFi.RSSI()) + " dBm)</dd>";
+  html += "<dt>Uptime</dt><dd>" + String(uptime_text) + "</dd>";
+  html += "<dt>Firmware</dt><dd>" __DATE__ " " __TIME__ "</dd>";
+  html += F("</dl></div>");
+
+  html += F("<form method=\"post\" action=\"/sync\"><button class=\"secondary\">Sync time from NTP</button></form>");
+
+  html += F("<form method=\"post\" action=\"/settings\"><h2>Time</h2><div class=\"card\">");
+  html += HtmlSelect("time_hr", "Time format", HtmlOption(HR12, "12-hour", time_hr) + HtmlOption(HR24, "24-hour", time_hr));
+  html += HtmlSelect("leading_zero", "Leading zero", HtmlOption(ON, "On", leading_zero) + HtmlOption(OFF, "Off", leading_zero));
+  options = "";
+  for(int i = 0; i < 7; i++) options += HtmlOption(flipSpeed[i], flipSpeed[i] == 0 ? "No delay" : String(flipSpeed[i]) + " ms", flip_disc_delay_time);
+  html += HtmlSelect("flip_delay", "Flip delay", options);
+  html += F("</div>");
+
+  html += F("<h2>Rest period</h2><div class=\"card\">");
+  html += HtmlSelect("rest_period", "Rest period", HtmlOption(ON, "On", rest_period) + HtmlOption(OFF, "Off", rest_period));
+  String sleep_options, wake_options;
+  for(int hour = 0; hour < 24; hour++)
+  {
+    sleep_options += HtmlOption(hour, FormatHour(hour), sleep_hour);
+    wake_options += HtmlOption(hour, FormatHour(hour), wake_hour);
+  }
+  html += HtmlSelect("sleep_hour", "Sleep at", sleep_options);
+  html += HtmlSelect("wake_hour", "Wake at", wake_options);
+  html += F("</div>");
+
+  html += F("<h2>Temperature &amp; humidity</h2><div class=\"card\">");
+  html += HtmlSelect("temp_on_off", "Show temperature", HtmlOption(ON, "On", temp_on_off) + HtmlOption(OFF, "Off", temp_on_off));
+  html += HtmlSelect("temp_c_f", "Unit", HtmlOption(TPF, "&deg;F", temp_c_f) + HtmlOption(TPC, "&deg;C", temp_c_f));
+  html += HtmlSelect("hum_on_off", "Show humidity", HtmlOption(ON, "On", hum_on_off) + HtmlOption(OFF, "Off", hum_on_off));
+  html += HtmlSelect("temp_hum_fq", "Show every", HtmlOption(THFQ60, "60 seconds", temp_hum_fq) + HtmlOption(THFQ30, "30 seconds", temp_hum_fq));
+  html += F("</div><button>Save settings</button></form></main></body></html>");
+
+  server.send(200, "text/html", html);
+}
+
+// Read an ON/OFF style option (0 or 1) from the form, keeping the current value if it's missing or invalid
+static uint8_t WebArgBool(const char *name, uint8_t current)
+{
+  if(!server.hasArg(name)) return current;
+  String value = server.arg(name);
+  if(value == "0") return 0;
+  if(value == "1") return 1;
+  return current;
+}
+
+// Read an hour (0-23) from the form, keeping the current value if it's missing or invalid
+static uint8_t WebArgHour(const char *name, uint8_t current)
+{
+  if(!server.hasArg(name)) return current;
+  String value = server.arg(name);
+  int hour = value.toInt();
+  if(value.length() == 0 || hour < 0 || hour > 23 || (hour == 0 && value != "0")) return current;
+  return hour;
+}
+
+void HandleWebSettings(void)
+{
+  time_hr = WebArgBool("time_hr", time_hr);
+  leading_zero = WebArgBool("leading_zero", leading_zero);
+  rest_period = WebArgBool("rest_period", rest_period);
+  sleep_hour = WebArgHour("sleep_hour", sleep_hour);
+  wake_hour = WebArgHour("wake_hour", wake_hour);
+  temp_on_off = WebArgBool("temp_on_off", temp_on_off);
+  temp_c_f = WebArgBool("temp_c_f", temp_c_f);
+  hum_on_off = WebArgBool("hum_on_off", hum_on_off);
+  temp_hum_fq = WebArgBool("temp_hum_fq", temp_hum_fq);
+
+  // The flip delay must be one of the values the speed menu offers
+  if(server.hasArg("flip_delay"))
+  {
+    int delay_time = server.arg("flip_delay").toInt();
+    for(int i = 0; i < 7; i++)
+    {
+      if(delay_time == flipSpeed[i]) flip_disc_delay_time = delay_time;
+    }
+  }
+
+  ApplySettings();
+
+  server.sendHeader("Location", "/?msg=saved");
+  server.send(303);
+}
+
+// Save every setting to EEPROM and redraw the display, as the button settings menus do on exit
+void ApplySettings(void)
+{
+  EEPROM.write(ee_delay_address, flip_disc_delay_time);
+  EEPROM.write(ee_leading_zero_address, leading_zero);
+  EEPROM.write(ee_rest_period_address, rest_period);
+  EEPROM.write(ee_sleep_hour_address, sleep_hour);
+  EEPROM.write(ee_wake_hour_address, wake_hour);
+  EEPROM.write(ee_time_hr_address, time_hr);
+  EEPROM.write(ee_temp_on_off_address, temp_on_off);
+  EEPROM.write(ee_temp_c_f_address, temp_c_f);
+  EEPROM.write(ee_hum_on_off_address, hum_on_off);
+  EEPROM.write(ee_temp_hum_fq_address, temp_hum_fq);
+
+  // Required for Arduino Nano ESP32, saves the changes to the EEPROM
+  #if defined(ARDUINO_ARCH_ESP32)
+    EEPROM.commit();
+  #endif
+
+  Serial.println("Settings saved from the web page");
+
+  Flip.Delay(flip_disc_delay_time);
+
+  // Restart the time/temperature/humidity sequence and redisplay the same way
+  // the RTC minute interrupt does, so the rest period is respected
+  sequenceRunning = false;
+  sequenceSecondRun = false;
+  timeDisplayStatus = false;
+  currentTimeStatus = false;
+  interruptRtcStatus = true;
+}
+
+void HandleWebSync(void)
+{
+  server.sendHeader("Location", SyncTimeNTP() ? "/?msg=synced" : "/?msg=nosync");
+  server.send(303);
 }
 
 /************************************************************************************************/
@@ -642,9 +898,11 @@ void CheckRestPeriod(void)
   
   bool clockStatus = false;
 
-  // This part of the code checks if the sleep_hour is greater than the wake_hour. 
+  // If the rest period is turned off, the clock is always on
+  if(rest_period == OFF) clockStatus = true;
+  // This part of the code checks if the sleep_hour is greater than the wake_hour.
   // If so, it means that the time interval for the clock to be turned off passes through midnight
-  if(sleep_hour > wake_hour) 
+  else if(sleep_hour > wake_hour)
   {
     // This condition checks if the current_hour is within the range where the clock should be turned off
     if(current_hour >= sleep_hour || current_hour < wake_hour) clockStatus = false;
