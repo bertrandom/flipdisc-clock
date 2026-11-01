@@ -41,6 +41,7 @@
 #include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <esp_sntp.h>
 #include "time.h"
 #include <arduino_secrets.h>
 
@@ -65,6 +66,7 @@ void SettingTemp(void);
 void SettingTime(void);
 void HandleNetwork(void);
 bool SyncTimeNTP(void);
+void PublishState(void);
 void SetupWebServer(void);
 void HandleWebRoot(void);
 void HandleWebSettings(void);
@@ -213,9 +215,25 @@ static const uint16_t ee_temp_hum_fq_address = 9;  // Temperature and humidity d
 // Required for EEPROM.begin(eeprom_size) for Arduino Nano ESP32
 static const uint8_t eeprom_size = 10;
 
+// MQTT topics - MQTT_TOPIC receives words to display, the clock publishes its readings
+// to MQTT_TOPIC/state and "online"/"offline" to MQTT_TOPIC/status (both retained)
+#ifndef MQTT_TOPIC
 #define MQTT_TOPIC "iot/flipdisc"
+#endif
+#define MQTT_STATE_TOPIC MQTT_TOPIC "/state"
+#define MQTT_STATUS_TOPIC MQTT_TOPIC "/status"
+
+// Set by scripts/git_version.py
+#ifndef GIT_SHA
+#define GIT_SHA "unknown"
+#endif
 
 ESP32MQTTClient mqttClient;
+
+// How often the temperature and humidity are published to MQTT_STATE_TOPIC
+const unsigned long mqtt_publish_interval = 60000;
+unsigned long mqtt_publish_time = 0;
+bool mqttPublishedOnce = false;
 
 // MQTT messages arrive on the esp-mqtt task, but the flip-disc display must only be
 // driven from loop(). The MQTT callback copies each payload into this queue and
@@ -227,7 +245,10 @@ static const uint8_t mqtt_queue_length = 8;
 QueueHandle_t mqttMessageQueue;
 
 // How long a word, temperature or humidity shown from MQTT stays up before the time comes back
-const unsigned long mqtt_hold_interval = 10000;
+#ifndef MQTT_HOLD_MS
+#define MQTT_HOLD_MS 10000
+#endif
+const unsigned long mqtt_hold_interval = MQTT_HOLD_MS;
 unsigned long mqtt_hold_start_time = 0;
 bool mqttHoldStatus = false;
 
@@ -241,10 +262,18 @@ bool networkStarted = false;
 #endif
 #define NTP_SERVER "pool.ntp.org"
 
-// The RTC is checked against NTP once per boot, after the first successful NTP sync,
-// and again whenever "Sync time from NTP" is pressed on the web page
+// The RTC is checked against NTP after the first NTP sync, then every hour so daylight saving
+// changes and RTC drift are picked up, and whenever "Sync time from NTP" is pressed on the web page
+const unsigned long ntp_check_interval = 3600000UL;
 bool ntpSyncDone = false;
-long ntp_last_difference = 0; // Seconds the RTC was off at the last NTP check
+unsigned long ntp_last_check_time = 0; // millis() of the last RTC check
+long ntp_last_difference = 0;          // Seconds the RTC was off at the last RTC check
+
+// Between syncs the system clock runs on the ESP32's crystal, which drifts more than the RTC,
+// so the RTC is only set if SNTP has synced recently. SNTP is set to resync every hour
+const unsigned long ntp_max_sync_age = 2 * 3600000UL;
+volatile unsigned long sntp_last_sync_time = 0; // millis() of the last SNTP sync, set on the lwIP task
+volatile bool sntpSynced = false;
 
 // Web config page, started with OTA and MQTT. handleClient() runs from loop(),
 // so its handlers can safely change settings and drive the display
@@ -360,8 +389,8 @@ void setup()
   // If the read values ​​are incorrect, set the default values
   if(leading_zero != ON && leading_zero != OFF) leading_zero = ON;         // Turn ON leading zero display
   if(rest_period != OFF && rest_period != ON) rest_period = OFF;           // Clock rest period ON/OFF
-  if(sleep_hour < 0 || sleep_hour > 23) sleep_hour = 0;                    // Set sleep hour to 0
-  if(wake_hour < 0 || wake_hour > 23) wake_hour = 0;                       // Set wake hour to 0
+  if(sleep_hour > 23) sleep_hour = 0;                                      // Set sleep hour to 0
+  if(wake_hour > 23) wake_hour = 0;                                        // Set wake hour to 0
   if(time_hr != HR12 && time_hr != HR24) time_hr = HR12;                   // Set the time display to 12 hour format
   if(temp_on_off != ON && temp_on_off != OFF) temp_on_off = OFF;           // Turn off the temperature and humidity display, the other options have no effect
   if(temp_c_f != TPF && temp_c_f != TPC) temp_c_f = TPF;                   // Set temperature display in fahrenheit
@@ -376,6 +405,7 @@ void setup()
   WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASSWORD);
 
   mqttClient.enableDebuggingMessages(); // Enable debugging messages sent to serial output
+  mqttClient.enableLastWillMessage(MQTT_STATUS_TOPIC, "offline", true); // Broker publishes this if the clock drops off
   mqttClient.setURL(SECRET_MQTT_HOSTNAME, SECRET_MQTT_PORT, SECRET_MQTT_USER, SECRET_MQTT_PASSWORD);
   mqttClient.setMqttClientName(SECRET_MQTT_CLIENT_NAME);
 
@@ -409,6 +439,12 @@ void HandleNetwork(void)
     Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
     ArduinoOTA.begin(); // Also starts mDNS, so the clock is reachable as <hostname>.local
     mqttClient.loopStart(); // Starts the esp-mqtt task and returns immediately
+    // Runs on the lwIP task after every SNTP sync - only record when it happened
+    sntp_set_time_sync_notification_cb([](struct timeval *tv) {
+      sntp_last_sync_time = millis();
+      sntpSynced = true;
+    });
+    sntp_set_sync_interval(ntp_check_interval); // The core's default is every 3 hours
     configTzTime(TIMEZONE, NTP_SERVER); // Starts SNTP in the background
     server.begin();
     MDNS.addService("http", "tcp", 80);
@@ -417,18 +453,26 @@ void HandleNetwork(void)
 
   ArduinoOTA.handle();
   server.handleClient();
-  if(ntpSyncDone == false) SyncTimeNTP();
+  if(ntpSyncDone == false || millis() - ntp_last_check_time >= ntp_check_interval) SyncTimeNTP();
+  PublishState();
 }
 
 /************************************************************************************************/
-// Once SNTP has the time, update the RTC if it differs. Called from loop() until it succeeds.
-// Returns false if SNTP doesn't have the time yet
+// Update the RTC from NTP if it differs. Called from loop() until the first check succeeds,
+// then every ntp_check_interval. Returns false if there's no recent NTP time to check against
 bool SyncTimeNTP(void)
 {
   // Don't change the time underneath the settings menus
   if(modeSettingsStatus == true) return false;
 
-  // Returns false until SNTP has set the system clock; a 0ms timeout keeps this non-blocking
+  // Only trust the system clock if SNTP has synced recently
+  if(sntpSynced == false || millis() - sntp_last_sync_time > ntp_max_sync_age)
+  {
+    // Try again in a minute rather than on every loop
+    if(ntpSyncDone == true) ntp_last_check_time = millis() - ntp_check_interval + 60000;
+    return false;
+  }
+
   struct tm local;
   if(!getLocalTime(&local, 0)) return false;
 
@@ -459,8 +503,40 @@ bool SyncTimeNTP(void)
   else Serial.println("RTC matches NTP time");
 
   ntp_last_difference = difference;
+  ntp_last_check_time = millis();
   ntpSyncDone = true;
   return true;
+}
+
+/************************************************************************************************/
+// Publish the temperature and humidity to MQTT_STATE_TOPIC every mqtt_publish_interval.
+// Runs from loop(), so reading the sensor can't overlap the display's own measurements
+void PublishState(void)
+{
+  if(!mqttClient.isConnected()) return;
+  if(mqttPublishedOnce == true && millis() - mqtt_publish_time < mqtt_publish_interval) return;
+
+  mqtt_publish_time = millis();
+  mqttPublishedOnce = true;
+
+  // Raw readings, not the heat index the clock displays
+  float celsius = dht.readTemperature();
+  float web_humidity = dht.readHumidity();
+  if(isnan(celsius) || isnan(web_humidity))
+  {
+    Serial.println("DHT read failed, not publishing state");
+    return;
+  }
+
+  float fahrenheit = dht.convertCtoF(celsius);
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"temperature_c\":%.1f,\"temperature_f\":%.1f,\"humidity\":%.1f,"
+           "\"heat_index_c\":%.1f,\"heat_index_f\":%.1f}",
+           celsius, fahrenheit, web_humidity,
+           dht.computeHeatIndex(celsius, web_humidity, false),
+           dht.computeHeatIndex(fahrenheit, web_humidity, true));
+  mqttClient.publish(MQTT_STATE_TOPIC, payload, 0, true);
 }
 
 /************************************************************************************************/
@@ -527,6 +603,7 @@ void HandleWebRoot(void)
   {
     if(abs(ntp_last_difference) > 1) ntp_text = "RTC was off by " + String(ntp_last_difference) + "s and was corrected";
     else ntp_text = "RTC matched NTP";
+    ntp_text += " " + String((millis() - ntp_last_check_time) / 60000) + " min ago";
   }
 
   unsigned long uptime = millis() / 1000;
@@ -537,7 +614,7 @@ void HandleWebRoot(void)
   String msg = server.arg("msg");
   if(msg == "saved") message = "Settings saved.";
   else if(msg == "synced") message = "Time checked against NTP. " + ntp_text + ".";
-  else if(msg == "nosync") message = "NTP time isn't available yet, try again in a moment.";
+  else if(msg == "nosync") message = "There's no recent NTP time to check against, try again in a moment.";
 
   String options;
   String html;
@@ -580,7 +657,7 @@ void HandleWebRoot(void)
   html += "<dt>WiFi</dt><dd>" + ssid + " (" + String(WiFi.RSSI()) + " dBm)</dd>";
   html += "<dt>IP address</dt><dd>" + WiFi.localIP().toString() + "</dd>";
   html += "<dt>Uptime</dt><dd>" + String(uptime_text) + "</dd>";
-  html += "<dt>Firmware</dt><dd>" __DATE__ " " __TIME__ "</dd>";
+  html += "<dt>Firmware</dt><dd>" GIT_SHA " (built " __DATE__ " " __TIME__ ")</dd>";
   html += F("</dl></div>");
 
   html += F("<form method=\"post\" action=\"/sync\"><button class=\"secondary\">Sync time from NTP</button></form>");
@@ -706,6 +783,9 @@ void HandleWebSync(void)
 void onMqttConnect(esp_mqtt_client_handle_t client)
 {
   if(!mqttClient.isMyTurn(client)) return;
+
+  // Replaces the retained "offline" last will set in setup()
+  mqttClient.publish(MQTT_STATUS_TOPIC, "online", 0, true);
 
   // Runs on the esp-mqtt task - only queue the payload, never touch the display here
   mqttClient.subscribe(MQTT_TOPIC, [](const std::string &payload) {
